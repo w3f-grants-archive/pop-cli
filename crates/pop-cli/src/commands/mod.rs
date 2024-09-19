@@ -98,17 +98,13 @@ impl Command {
 			},
 			Self::Call(args) => match args.command {
 				#[cfg(feature = "parachain")]
-				call::Command::Parachain(cmd) => call::parachain::CallParachain { cli: &mut Cli, args: cmd }
-					.execute()
-					.await
-					.map(|_| Value::Null),
+				call::Command::Parachain(cmd) => cmd.execute().await.map(|_| Value::Null),
 				#[cfg(feature = "contract")]
-				call::Command::Contract(cmd) => {
+				call::Command::Contract(cmd) =>
 					Box::new(call::contract::CallContract { cli: &mut Cli, args: cmd })
 						.execute()
 						.await
-						.map(|_| Value::Null)
-				},
+						.map(|_| Value::Null),
 			},
 			#[cfg(any(feature = "parachain", feature = "contract"))]
 			Self::Up(args) => match args.command {
