@@ -51,7 +51,7 @@ pub async fn query(
 	Ok(())
 }
 
-pub async fn parse_chain_metadata(metadata: Metadata) -> Result<Vec<Pallet>, Error> {
+pub async fn parse_chain_metadata(metadata: &Metadata) -> Result<Vec<Pallet>, Error> {
 	let mut pallets: Vec<Pallet> = Vec::new();
 	for pallet in metadata.pallets() {
 		let extrinsics =
@@ -66,8 +66,9 @@ pub async fn parse_chain_metadata(metadata: Metadata) -> Result<Vec<Pallet>, Err
 						docs: entry.docs().concat(),
 						ty: match entry.entry_type() {
 							StorageEntryType::Plain(value) => (*value, None),
-							StorageEntryType::Map { value_ty, key_ty, .. } =>
-								(*value_ty, Some(*key_ty)),
+							StorageEntryType::Map { value_ty, key_ty, .. } => {
+								(*value_ty, Some(*key_ty))
+							},
 						},
 					})
 					.collect()
