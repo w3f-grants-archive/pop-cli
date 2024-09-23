@@ -1,26 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0
 
 use crate::cli::{self, traits::*};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::Args;
 use pop_parachains::{
-	fetch_metadata, get_type_description, parse_chain_metadata, query, submit_extrinsic, Metadata,
+	prepare_extrinsic, set_up_api, submit_extrinsic, OnlineClient, Pallet, SubstrateConfig,
 };
+use strum::VariantArray;
+
+use super::use_cases::prompt_arguments;
 
 #[derive(Args, Clone)]
 pub struct CallParachainCommand {
-	/// The name of the pallet to call.
+	/// The signed extrinsic to call.
 	#[clap(long, short)]
-	pallet: Option<String>,
-	/// The name of extrinsic to call.
-	#[clap(long, short, conflicts_with = "query")]
 	extrinsic: Option<String>,
-	/// The name of storage to query.
-	#[clap(long, short, conflicts_with = "extrinsic")]
-	query: Option<String>,
-	/// The constructor arguments, encoded as strings.
-	#[clap(long, num_args = 0..)]
-	args: Vec<String>,
 	/// Websocket endpoint of a node.
 	#[clap(name = "url", long, value_parser, default_value = "ws://localhost:9944")]
 	url: String,
@@ -32,194 +26,102 @@ pub struct CallParachainCommand {
 	#[clap(name = "suri", long, short, default_value = "//Alice")]
 	suri: String,
 }
+
 impl CallParachainCommand {
 	/// Executes the command.
 	pub(crate) async fn execute(mut self) -> Result<()> {
-		let metadata = self.query_metadata(&mut cli::Cli).await?;
-		let call_config =
-			if self.pallet.is_none() && (self.extrinsic.is_none() || self.query.is_none()) {
-				guide_user_to_call_chain(&metadata, &mut cli::Cli).await?
-			} else {
-				self.clone()
-			};
-		execute_extrinsic(
-			call_config,
-			&metadata,
-			self.pallet.is_none() && (self.extrinsic.is_none() || self.query.is_none()),
-			&mut cli::Cli,
-		)
-		.await?;
+		let (api, url) = self.set_up_api(&mut cli::Cli).await?;
+		let call_config = if self.extrinsic.is_none() {
+			guide_user_to_call_chain(&api, url, &mut cli::Cli).await?
+		} else {
+			self.clone()
+		};
+		execute_extrinsic(api, call_config, self.extrinsic.is_none(), &mut cli::Cli).await?;
 		Ok(())
 	}
 	/// Prompt the user for the chain to use if not indicated and fetch the metadata.
-	async fn query_metadata(
+	async fn set_up_api(
 		&mut self,
 		cli: &mut impl cli::traits::Cli,
-	) -> anyhow::Result<Metadata> {
+	) -> anyhow::Result<(OnlineClient<SubstrateConfig>, String)> {
 		cli.intro("Call a parachain")?;
-		let url: String =
-			if self.pallet.is_none() && (self.extrinsic.is_none() || self.query.is_none()) {
-				// Prompt for contract location.
-				cli.input("Which chain would you like to interact with?")
-					.placeholder("wss://rpc1.paseo.popnetwork.xyz")
-					.default_input("wss://rpc1.paseo.popnetwork.xyz")
-					.interact()?
-			} else {
-				self.url.clone()
-			};
-		let metadata = fetch_metadata(&url).await?;
-		Ok(metadata)
+		let url: String = if self.extrinsic.is_none() {
+			// Prompt for contract location.
+			cli.input("Which chain would you like to interact with?")
+				.placeholder("wss://rpc1.paseo.popnetwork.xyz")
+				.default_input("wss://rpc1.paseo.popnetwork.xyz")
+				.interact()?
+		} else {
+			self.url.clone()
+		};
+		let api = set_up_api(&url).await?;
+		Ok((api, url))
 	}
 	/// Display the call.
 	fn display(&self) -> String {
 		let mut full_message = "pop call parachain".to_string();
-		if let Some(pallet) = &self.pallet {
-			full_message.push_str(&format!(" --pallet {}", pallet));
-		}
 		if let Some(extrinsic) = &self.extrinsic {
 			full_message.push_str(&format!(" --extrinsic {}", extrinsic));
 		}
-		if let Some(query) = &self.query {
-			full_message.push_str(&format!(" --query {}", query));
+		full_message.push_str(&format!("--url {}", self.url));
+		if !self.suri.is_empty() {
+			full_message.push_str(&format!(" --suri {}", self.suri));
 		}
-		if !self.args.is_empty() {
-			full_message.push_str(&format!(" --args {}", self.args.join(" ")));
-		}
-		full_message.push_str(&format!(" --url {} --suri {}", self.url, self.suri));
 		full_message
 	}
 }
 
-#[derive(Clone, Eq, PartialEq)]
-enum Action {
-	Extrinsic,
-	Query,
-}
-
 /// Guide the user to call the contract.
 async fn guide_user_to_call_chain(
-	metadata: &Metadata,
+	api: &OnlineClient<SubstrateConfig>,
+	url: String,
 	cli: &mut impl cli::traits::Cli,
 ) -> anyhow::Result<CallParachainCommand> {
-	let pallets = match parse_chain_metadata(metadata).await {
-		Ok(pallets) => pallets,
-		Err(e) => {
-			cli.outro_cancel("Unable to fetch the chain metadata.")?;
-			return Err(anyhow!(format!("{}", e.to_string())));
-		},
-	};
+	let pallets = Pallet::VARIANTS;
 	let pallet = {
 		let mut prompt = cli.select("Select the pallet to call:");
 		for pallet_item in pallets {
-			prompt = prompt.item(pallet_item.clone(), &pallet_item.label, &pallet_item.docs);
+			prompt = prompt.item(pallet_item.clone(), pallet_item.as_ref(), "");
 		}
 		prompt.interact()?
 	};
-	let action = cli
-		.select("What do you want to do?")
-		.item(Action::Extrinsic, "Submit an extrinsic", "")
-		.item(Action::Query, "Query storage", "")
-		.interact()?;
 
-	let mut args = Vec::new();
-	if action == Action::Extrinsic {
-		let extrinsic = {
-			let mut prompt_extrinsic = cli.select("Select the extrinsic to call:");
-			for extrinsic in pallet.extrinsics {
-				prompt_extrinsic = prompt_extrinsic.item(
-					extrinsic.clone(),
-					format!("{}\n", &extrinsic.name),
-					extrinsic.docs.concat(),
-				);
-			}
-			prompt_extrinsic.interact()?
-		};
-		for argument in extrinsic.fields {
-			let value = cli
-				.input(&format!(
-					"Enter the value for the argument '{}':",
-					argument.name.unwrap_or_default()
-				))
-				.placeholder(&argument.type_name.unwrap_or_default())
-				.required(false)
-				.interact()?;
-			args.push(value);
+	let extrinsic = {
+		let mut prompt_extrinsic = cli.select("Select the extrinsic to call:");
+		for extrinsic in pallet.extrinsics() {
+			prompt_extrinsic =
+				prompt_extrinsic.item(extrinsic.clone(), format!("{}\n", &extrinsic.as_ref()), "");
 		}
-		// Who is calling the contract.
-		let suri: String = cli
-			.input("Signer calling the contract:")
-			.placeholder("//Alice")
-			.default_input("//Alice")
-			.interact()?;
-		Ok(CallParachainCommand {
-			pallet: Some(pallet.label),
-			extrinsic: Some(extrinsic.name),
-			query: None,
-			args,
-			url: "wss://rpc2.paseo.popnetwork.xyz".to_string(),
-			suri,
-		})
-	} else {
-		let query = {
-			let mut prompt_storage = cli.select("Select the storage to query:");
-			for storage in pallet.storage {
-				prompt_storage = prompt_storage.item(
-					storage.clone(),
-					format!("{}\n", &storage.name),
-					&storage.docs,
-				);
-			}
-			prompt_storage.interact()?
-		};
-		let keys_needed = get_type_description(query.ty.1, metadata)?;
-		for key in keys_needed {
-			let value =
-				cli.input(&format!("Enter the key '{}':", key)).required(false).interact()?;
-			args.push(value);
-		}
-		Ok(CallParachainCommand {
-			pallet: Some(pallet.label),
-			extrinsic: None,
-			query: Some(query.name),
-			args,
-			url: "wss://rpc2.paseo.popnetwork.xyz".to_string(),
-			suri: "//Alice".to_string(),
-		})
-	}
+		prompt_extrinsic.interact()?
+	};
+	let args = prompt_arguments(&extrinsic, cli)?;
+	let suri = cli::Cli
+		.input("Who is going to sign the extrinsic:")
+		.placeholder("//Alice")
+		.default_input("//Alice")
+		.interact()?;
+	let encoded_call_data =
+		prepare_extrinsic(api, pallet.as_ref(), extrinsic.as_ref(), args, &suri).await?;
+	Ok(CallParachainCommand { extrinsic: Some(encoded_call_data), url, suri })
 }
 
 /// Executes the extrinsic or query.
 async fn execute_extrinsic(
+	api: OnlineClient<SubstrateConfig>,
 	call_config: CallParachainCommand,
-	metadata: &Metadata,
 	prompt_to_repeat_call: bool,
 	cli: &mut impl cli::traits::Cli,
 ) -> Result<()> {
 	cli.info(call_config.display())?;
-	let pallet = call_config
-		.pallet
-		.expect("pallet can not be none as fallback above is interactive input; qed");
-	// TODO: Check if exists?
-	if call_config.extrinsic.is_some() {
-		let extrinsic = call_config
-			.extrinsic
-			.expect("storage can not be none as fallback above is interactive input; qed");
-		let result = submit_extrinsic(
-			&pallet,
-			&extrinsic,
-			call_config.args,
-			&call_config.url,
-			&call_config.suri,
-		)
-		.await?;
-		cli.outro(format!("Extrinsic submitted successfully with hash: {}", result))?;
-	} else {
-		let storage = call_config
-			.query
-			.expect("storage can not be none as fallback above is interactive input; qed");
-		let result = query(&pallet, &storage, call_config.args, &call_config.url).await?;
-		cli.outro(result)?;
+	let extrinsic = call_config
+		.extrinsic
+		.expect("extrinsic can not be none as fallback above is interactive input; qed");
+	if !cli.confirm("Do you want to sign and submit the call?").interact()? {
+		display_message(&format!("Extrinsic: {} not submitted", extrinsic), true, cli)?;
+		return Ok(());
 	}
+	// TODO: Handle error
+	let result = submit_extrinsic(api.clone(), extrinsic).await?;
 	// Repeat call.
 	if prompt_to_repeat_call {
 		let another_call: bool = cli
@@ -229,14 +131,21 @@ async fn execute_extrinsic(
 		if another_call {
 			// Remove only the prompt asking for another call.
 			console::Term::stderr().clear_last_lines(2)?;
-			let new_call_config = guide_user_to_call_chain(metadata, cli).await?;
-			Box::pin(execute_extrinsic(new_call_config, metadata, prompt_to_repeat_call, cli))
-				.await?;
+			let new_call_config = guide_user_to_call_chain(&api, call_config.url, cli).await?;
+			Box::pin(execute_extrinsic(api, new_call_config, prompt_to_repeat_call, cli)).await?;
 		} else {
-			display_message("Call completed successfully!", true, cli)?;
+			display_message(
+				&format!("Extrinsic submitted successfully with hash: {}", result),
+				true,
+				cli,
+			)?;
 		}
 	} else {
-		display_message("Call completed successfully!", true, cli)?;
+		display_message(
+			&format!("Extrinsic submitted successfully with hash: {}", result),
+			true,
+			cli,
+		)?;
 	}
 	Ok(())
 }

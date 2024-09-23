@@ -2,162 +2,178 @@
 
 use crate::errors::Error;
 use pop_common::create_signer;
-use scale_info::{form::PortableForm, Variant};
-use scale_typegen_description::type_description;
 use scale_value::{stringify, Value};
-use subxt::{metadata::types::StorageEntryType, Metadata, OnlineClient, SubstrateConfig};
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct Storage {
-	pub name: String,
-	pub docs: String,
-	pub ty: (u32, Option<u32>),
+use strum::{EnumMessage as _, EnumProperty as _, VariantArray as _};
+use strum_macros::{AsRefStr, Display, EnumMessage, EnumProperty, EnumString, VariantArray};
+use subxt::{
+	config::DefaultExtrinsicParamsBuilder, tx::SubmittableExtrinsic, OnlineClient, SubstrateConfig,
+};
+/// A supported pallet.
+#[derive(AsRefStr, Clone, Debug, Display, EnumMessage, EnumString, Eq, PartialEq, VariantArray)]
+pub enum Pallet {
+	//Assets.
+	#[strum(serialize = "Assets")]
+	Assets,
+	//Balances.
+	#[strum(serialize = "Balances")]
+	Balances,
+	/// NFT.
+	#[strum(serialize = "Nfts")]
+	Nfts,
+}
+impl Pallet {
+	/// Get the list of extrinsics available.
+	pub fn extrinsics(&self) -> Vec<&Extrinsic> {
+		Extrinsic::VARIANTS
+			.iter()
+			.filter(|t| t.get_str("Pallet") == Some(self.as_ref()))
+			.collect()
+	}
 }
 
-#[derive(Clone, PartialEq, Eq)]
-/// Describes a contract message.
-pub struct Pallet {
-	/// The label of the message.
-	pub label: String,
-	/// The message documentation.
-	pub docs: String,
-	// The extrinsics of the pallet.
-	pub extrinsics: Vec<Variant<PortableForm>>,
-	// The storage of the pallet.
-	pub storage: Vec<Storage>,
+#[derive(
+	AsRefStr,
+	Clone,
+	Debug,
+	Display,
+	EnumMessage,
+	EnumProperty,
+	EnumString,
+	Eq,
+	PartialEq,
+	VariantArray,
+)]
+pub enum Extrinsic {
+	#[strum(serialize = "create_asset", message = "create", props(Pallet = "Assets"))]
+	CreateAsset,
+	#[strum(serialize = "mint_asset", message = "mint", props(Pallet = "Asset"))]
+	MintAsset,
+	#[strum(serialize = "create_nft", message = "create", props(Pallet = "Nfts"))]
+	CreateCollection,
+	#[strum(serialize = "mint", message = "mint", props(Pallet = "Nft"))]
+	MintNFT,
+	#[strum(serialize = "transfer", message = "transfer_allow_death", props(Pallet = "Balances"))]
+	Transfer,
+}
+impl Extrinsic {
+	/// Get the template's name.
+	fn extrinsic_name(&self) -> &str {
+		self.get_message().unwrap_or_default()
+	}
+	/// Get the pallet of the extrinsic.
+	pub fn pallet(&self) -> Result<&str, Error> {
+		self.get_str("Pallet").ok_or(Error::PalletMissing)
+	}
 }
 
-pub async fn fetch_metadata(url: &str) -> Result<Metadata, Error> {
+pub fn parse_string_into_scale_value(str: &str) -> Result<Value, Error> {
+	let value = stringify::from_str(str)
+		.0
+		.map_err(|_| Error::ParsingValueError(str.to_string()))?;
+	Ok(value)
+}
+
+pub async fn set_up_api(url: &str) -> Result<OnlineClient<SubstrateConfig>, Error> {
 	let api = OnlineClient::<SubstrateConfig>::from_url(url).await?;
-	Ok(api.metadata())
+	Ok(api)
 }
 
-pub async fn query(
+// pub async fn prepare_query(
+// 	api: &OnlineClient<SubstrateConfig>,
+// 	pallet_name: &str,
+// 	entry_name: &str,
+// 	args: Vec<Value>,
+// ) -> Result<Vec<u8>, Error> {
+// 	//let args = convert_vec(args_value)?;
+// 	let storage = subxt::dynamic::storage(pallet_name, entry_name, args);
+// 	let addr_bytes = api.storage().address_bytes(&storage)?;
+//  let result = api.storage().at_latest().await?.fetch(&storage).await?;
+// 	Ok(addr_bytes)
+// }
+fn encode_extrinsic(encoded_call_data: Vec<u8>) -> String {
+	format!("0x{}", hex::encode(encoded_call_data))
+}
+fn decode_extrinsic(encoded_call_data: String) -> Result<Vec<u8>, Error> {
+	let hex_data = encoded_call_data.trim_start_matches("0x");
+	Ok(hex::decode(hex_data)?)
+}
+pub async fn prepare_extrinsic(
+	api: &OnlineClient<SubstrateConfig>,
 	pallet_name: &str,
 	entry_name: &str,
-	args: Vec<String>,
-	url: &str,
+	args_value: Vec<Value>,
+	suri: &str,
 ) -> Result<String, Error> {
-	let args_value: Vec<Value> =
-		args.into_iter().map(|v| stringify::from_str(&v).0.unwrap()).collect();
-	let api = OnlineClient::<SubstrateConfig>::from_url(url).await?;
-	let storage_query = subxt::dynamic::storage(pallet_name, entry_name, args_value);
-	let result = api.storage().at_latest().await?.fetch(&storage_query).await?;
-	if result.is_none() {
-		Ok("".to_string())
-	} else {
-		Ok(result.unwrap().to_value()?.to_string())
-	}
+	let signer = create_signer(suri)?;
+	let tx = subxt::dynamic::tx(pallet_name, entry_name, args_value);
+	let signed_extrinsic: SubmittableExtrinsic<SubstrateConfig, OnlineClient<SubstrateConfig>> =
+		api.tx()
+			.create_signed(&tx, &signer, DefaultExtrinsicParamsBuilder::new().build())
+			.await?;
+	Ok(encode_extrinsic(signed_extrinsic.encoded().to_vec()))
 }
 
 pub async fn submit_extrinsic(
-	pallet_name: &str,
-	entry_name: &str,
-	args: Vec<String>,
-	url: &str,
-	suri: &str,
+	api: OnlineClient<SubstrateConfig>,
+	encoded_extrinsic: String,
 ) -> Result<String, Error> {
-	let args_value: Vec<Value> = args
-		.into_iter()
-		.filter_map(|v| match stringify::from_str(&v).0 {
-			Ok(value) => Some(value),
-			Err(_) => None,
-		})
-		.collect();
-	let api = OnlineClient::<SubstrateConfig>::from_url(url).await?;
-	let tx = subxt::dynamic::tx(pallet_name, entry_name, args_value);
-	let signer = create_signer(suri)?;
-	let result = api
-		.tx()
-		.sign_and_submit_then_watch_default(&tx, &signer)
-		.await?
-		.wait_for_finalized_success()
-		.await?;
+	let extrinsic = decode_extrinsic(encoded_extrinsic)?;
+	let signed_extrinsic: SubmittableExtrinsic<SubstrateConfig, OnlineClient<SubstrateConfig>> =
+		SubmittableExtrinsic::from_bytes(api, extrinsic);
+	let result = signed_extrinsic.submit_and_watch().await?.wait_for_finalized().await?;
 	Ok(result.extrinsic_hash().to_string())
-}
-
-pub async fn parse_chain_metadata(metadata: &Metadata) -> Result<Vec<Pallet>, Error> {
-	let mut pallets: Vec<Pallet> = Vec::new();
-	for pallet in metadata.pallets() {
-		let extrinsics =
-			pallet.call_variants().map(|variants| variants.to_vec()).unwrap_or_default(); // Return an empty Vec if Option is None
-		let storage: Vec<Storage> = pallet
-			.storage()
-			.map(|m| {
-				m.entries()
-					.iter()
-					.map(|entry| Storage {
-						name: entry.name().to_string(),
-						docs: entry.docs().concat(),
-						ty: match entry.entry_type() {
-							StorageEntryType::Plain(value) => (*value, None),
-							StorageEntryType::Map { value_ty, key_ty, .. } => {
-								(*value_ty, Some(*key_ty))
-							},
-						},
-					})
-					.collect()
-			})
-			.unwrap_or_default(); // Return an empty Vec if Option is None
-
-		pallets.push(Pallet {
-			label: pallet.name().to_string(),
-			extrinsics,
-			docs: pallet.docs().join(" "),
-			storage,
-		});
-	}
-	Ok(pallets)
-}
-
-pub fn get_type_description(
-	key_ty_id: Option<u32>,
-	metadata: &Metadata,
-) -> Result<Vec<String>, Error> {
-	if let Some(key_ty_id) = key_ty_id {
-		let key_ty_description = type_description(key_ty_id, metadata.types(), false)?;
-		let result = key_ty_description.trim().trim_matches(|c| c == '(' || c == ')');
-
-		let parsed_result: Vec<String> = if result == "\"\"" {
-			vec![]
-		} else if !result.contains(',') {
-			vec![result.to_string()]
-		} else {
-			result.split(',').map(|s| s.trim().to_string()).collect()
-		};
-
-		Ok(parsed_result)
-	} else {
-		Ok(vec![])
-	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use anyhow::Result;
+	use pop_common::parse_account;
 
-	#[tokio::test]
-	async fn query_works() -> Result<()> {
-		let result =
-			query("Assets", "Asset", vec!["50".into()], "wss://rpc2.paseo.popnetwork.xyz").await?;
-		println!("{:?}", result);
-		// query("Nfts", "Collection", &metadata)?;
-		// query("Nfts", "NextCollectionId", &metadata)?;
+	// #[tokio::test]
+	// async fn query_works() -> Result<()> {
+	// 	let api = set_up_api("wss://rpc2.paseo.popnetwork.xyz").await?;
+	// 	let result = prepare_query(&api, "Assets", "Asset", vec!["50".into()]).await?;
+	// 	println!("{:?}", result);
+	// 	// query("Nfts", "Collection", &metadata)?;
+	// 	// query("Nfts", "NextCollectionId", &metadata)?;
 
-		Ok(())
-	}
+	// 	Ok(())
+	// }
 
 	#[tokio::test]
 	async fn extrinsic_works() -> Result<()> {
-		let result = query(
-			"Balances",
-			"TransferAllowDeath",
-			vec!["167Y1SbQrwQVNfkNUXtRkocfzVbaAHYjnZPkZRScWPQ46XDb".into(), "1".into()],
-			"wss://rpc2.paseo.popnetwork.xyz",
+		let api = set_up_api("ws://127.0.0.1:53677").await?;
+		// let result = prepare_extrinsic(
+		// 	&api,
+		// 	"Nfts",
+		// 	"mint",
+		// 	vec![
+		// 		"1".into(),
+		// 		"1".into(),
+		// 		"5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty".into(),
+		// 		"None".into(),
+		// 	],
+		// 	"//Alice",
+		// )
+		// .await?;
+		let bob = parse_account("5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")?;
+		let result = prepare_extrinsic(
+			&api,
+			"Assets",
+			"create",
+			vec![
+				Value::u128(3),
+				Value::unnamed_variant("Id", vec![Value::from_bytes(bob)]),
+				Value::u128(1000000),
+			],
+			"//Alice",
 		)
 		.await?;
-		println!("{:?}", result);
+		//println!("{:?}", result);
+		println!("{:?}", format!("0x{}", hex::encode(result)));
+		// let rs = submit_extrinsic(api, result).await?;
+		// println!("{:?}", rs);
 		// query("Nfts", "Collection", &metadata)?;
 		// query("Nfts", "NextCollectionId", &metadata)?;
 
